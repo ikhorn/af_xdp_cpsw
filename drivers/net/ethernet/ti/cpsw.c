@@ -14,6 +14,7 @@
  */
 
 #include <linux/kernel.h>
+
 #include <linux/io.h>
 #include <linux/clk.h>
 #include <linux/timer.h>
@@ -37,6 +38,9 @@
 #include <linux/if_vlan.h>
 #include <linux/kmemleak.h>
 #include <linux/sys_soc.h>
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
+#include <linux/filter.h>
 
 #include <linux/pinctrl/consumer.h>
 #include <net/pkt_cls.h>
@@ -425,6 +429,8 @@ static inline void slave_write(struct cpsw_slave *slave, u32 val, u32 offset)
 
 struct cpsw_vector {
 	struct cpdma_chan *ch;
+	/* TODO: We could use container_of + vector num probably. */
+	struct net_device *ndev;
 	int budget;
 };
 
@@ -454,11 +460,13 @@ struct cpsw_common {
 	int				rx_ch_num, tx_ch_num;
 	int				speed;
 	int				usage_count;
+	int				xdp_flush;
 };
 
 struct cpsw_priv {
 	struct net_device		*ndev;
 	struct device			*dev;
+	struct bpf_prog			*xdp_prog;
 	u32				msg_enable;
 	u8				mac_addr[ETH_ALEN];
 	bool				rx_pause;
@@ -468,6 +476,7 @@ struct cpsw_priv {
 	int				shp_cfg_speed;
 	int				tx_ts_enabled;
 	int				rx_ts_enabled;
+	struct xdp_rxq_info		xdp_rxq[CPSW_MAX_QUEUES];
 	u32 emac_port;
 	struct cpsw_common *cpsw;
 };
@@ -478,6 +487,10 @@ struct cpsw_stats {
 	int sizeof_stat;
 	int stat_offset;
 };
+
+/* The rxbuf shall include headroom compatible with both skb and xdpf */
+#define CPSW_RXBUF_HEADROOM (max(XDP_PACKET_HEADROOM, NET_SKB_PAD) + \
+			     NET_IP_ALIGN)
 
 enum {
 	CPSW_STATS,
@@ -836,24 +849,64 @@ static void cpsw_intr_disable(struct cpsw_common *cpsw)
 	return;
 }
 
-static void cpsw_tx_handler(void *token, int len, int status)
+/* Both skb and xdp frames go down the same route.
+ * In tx_handler callback we need to somehow distinguish whether we got skb or
+ * xdpf. Both pointers are guaranteed to have LSB == 0, so we can use it as
+ * a temporary marker.
+ */
+static int cpsw_is_xdpf_handle(void *handle)
 {
+	return (unsigned long)handle & BIT(0);
+}
+
+static void *cpsw_xdpf_to_handle(struct xdp_frame *xdpf)
+{
+	return (void *)((unsigned long)xdpf | BIT(0));
+}
+
+static struct xdp_frame *cpsw_handle_to_xdpf(void *handle)
+{
+	return (struct xdp_frame *)((unsigned long)handle & ~BIT(0));
+}
+
+struct cpsw_meta_xdpf {
+	struct net_device *ndev;
+	int ch;
+};
+
+static void cpsw_tx_handler(void *ctx, void *token, int len, int status)
+{
+	struct cpsw_meta_xdpf *frame_meta;
 	struct netdev_queue	*txq;
-	struct sk_buff		*skb = token;
-	struct net_device	*ndev = skb->dev;
-	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
+	struct sk_buff		*skb;
+	struct xdp_frame	*xdpf;
+	struct cpsw_vector	*txv = ctx;
+	struct net_device	*ndev;
+	int			ch;
+
+	if (cpsw_is_xdpf_handle(token)) {
+		xdpf = cpsw_handle_to_xdpf(token);
+		frame_meta = xdpf->data - xdpf->metasize;
+		ndev = frame_meta->ndev;
+		ch = frame_meta->ch;
+		xdp_return_frame_rx_napi(xdpf);
+	} else {
+		skb = token;
+		ndev = skb->dev;
+		ch = skb_get_queue_mapping(skb);
+		cpts_tx_timestamp(ndev_to_cpsw(ndev)->cpts, skb);
+		dev_kfree_skb_any(skb);
+	}
 
 	/* Check whether the queue is stopped due to stalled tx dma, if the
 	 * queue is stopped then start the queue as we have free desc for tx
 	 */
-	txq = netdev_get_tx_queue(ndev, skb_get_queue_mapping(skb));
+	txq = netdev_get_tx_queue(ndev, ch);
 	if (unlikely(netif_tx_queue_stopped(txq)))
 		netif_tx_wake_queue(txq);
 
-	cpts_tx_timestamp(cpsw->cpts, skb);
 	ndev->stats.tx_packets++;
 	ndev->stats.tx_bytes += len;
-	dev_kfree_skb_any(skb);
 }
 
 static void cpsw_rx_vlan_encap(struct sk_buff *skb)
@@ -899,22 +952,89 @@ static void cpsw_rx_vlan_encap(struct sk_buff *skb)
 	}
 }
 
-static void cpsw_rx_handler(void *token, int len, int status)
+static unsigned int cpsw_rxbuf_total_len(unsigned int len)
 {
-	struct cpdma_chan	*ch;
-	struct sk_buff		*skb = token;
-	struct sk_buff		*new_skb;
-	struct net_device	*ndev = skb->dev;
-	int			ret = 0, port;
-	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
+	len += CPSW_RXBUF_HEADROOM;
+	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	return SKB_DATA_ALIGN(len);
+}
+
+static void *cpsw_rxbuf_alloc(unsigned int len)
+{
+	return napi_alloc_frag(cpsw_rxbuf_total_len(len));
+}
+
+static int cpsw_ndo_xdp_xmit(struct net_device *ndev, int n,
+			     struct xdp_frame **frames, u32 flags);
+
+static int cpsw_run_xdp(struct cpsw_priv *priv, struct xdp_buff *xdp)
+{
+	struct cpsw_common *cpsw = priv->cpsw;
+	struct net_device *ndev = priv->ndev;
+	struct xdp_frame *xdpf;
+	struct bpf_prog *prog;
+	int ret = 0;
+	u32 act;
+
+	rcu_read_lock();
+
+	prog = READ_ONCE(priv->xdp_prog);
+	if (!prog) {
+		ret = 1;
+		goto out;
+	}
+
+	act = bpf_prog_run_xdp(prog, xdp);
+	switch (act) {
+	case XDP_PASS:
+		ret = 1;
+		break;
+	case XDP_TX:
+		xdpf = convert_to_xdp_frame(xdp);
+		if (unlikely(!xdpf))
+			xdp_return_buff(xdp);
+		else
+			cpsw_ndo_xdp_xmit(ndev, 1, &xdpf, XDP_XMIT_FLUSH);
+		break;
+	case XDP_REDIRECT:
+		ret = xdp_do_redirect(ndev, xdp, prog);
+		if (ret)
+			xdp_return_buff(xdp);
+		else
+			cpsw->xdp_flush = 1;
+		break;
+	default:
+		bpf_warn_invalid_xdp_action(act);
+		/* fall through */
+	case XDP_ABORTED:
+		trace_xdp_exception(ndev, prog, act);
+		/* fall through -- handle aborts by dropping packet */
+	case XDP_DROP:
+		xdp_return_buff(xdp);
+		break;
+	}
+out:
+	rcu_read_unlock();
+	return ret;
+}
+
+static void cpsw_rx_handler(void *ctx, void *token, int len, int status)
+{
+	struct sk_buff		*skb;
+	struct cpsw_vector	*rxv = ctx;
+	struct net_device	*ndev = rxv->ndev;
 	struct cpsw_priv	*priv;
+	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
+	int			ch = rxv - cpsw->rxv;
+	int			ret = 0, port;
+	int			headroom = CPSW_RXBUF_HEADROOM;
+	u8			*new_token;
+	struct xdp_buff		xdp;
 
 	if (cpsw->data.dual_emac) {
 		port = CPDMA_RX_SOURCE_PORT(status);
-		if (port) {
+		if (port)
 			ndev = cpsw->slaves[--port].ndev;
-			skb->dev = ndev;
-		}
 	}
 
 	if (unlikely(status < 0) || unlikely(!netif_running(ndev))) {
@@ -927,45 +1047,74 @@ static void cpsw_rx_handler(void *token, int len, int status)
 			 * in reducing of the number of rx descriptor in
 			 * DMA engine, requeue skb back to cpdma.
 			 */
-			new_skb = skb;
+			new_token = token;
 			goto requeue;
 		}
 
 		/* the interface is going down, skbs are purged */
-		dev_kfree_skb_any(skb);
+		skb_free_frag(token);
 		return;
 	}
 
-	new_skb = netdev_alloc_skb_ip_align(ndev, cpsw->rx_packet_max);
-	if (new_skb) {
-		skb_copy_queue_mapping(new_skb, skb);
-		skb_put(skb, len);
-		if (status & CPDMA_RX_VLAN_ENCAP)
-			cpsw_rx_vlan_encap(skb);
-		priv = netdev_priv(ndev);
-		if (priv->rx_ts_enabled)
-			cpts_rx_timestamp(cpsw->cpts, skb);
-		skb->protocol = eth_type_trans(skb, ndev);
-		netif_receive_skb(skb);
-		ndev->stats.rx_bytes += len;
-		ndev->stats.rx_packets++;
-		kmemleak_not_leak(new_skb);
-	} else {
+	new_token = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
+	if (!new_token) {
 		ndev->stats.rx_dropped++;
-		new_skb = skb;
+		new_token = token;
+		goto requeue;
 	}
+
+	priv = netdev_priv(ndev);
+	if (priv->xdp_prog) {
+		xdp_set_data_meta_invalid(&xdp);
+		xdp.data = (u8 *)token + CPSW_RXBUF_HEADROOM;
+		xdp.data_end = xdp.data + len;
+		xdp.data_hard_start = token;
+		xdp.rxq = &priv->xdp_rxq[ch];
+
+		ret = cpsw_run_xdp(priv, &xdp);
+		if (!ret)
+			goto requeue;
+
+		/* XDP prog might have changed packet data and boundaries! */
+		len = xdp.data_end - xdp.data;
+		headroom = xdp.data - xdp.data_hard_start;
+	}
+
+	/* Build skb and pass it to networking stack if XDP off or XDP prog
+	 * returned XDP_PASS
+	 */
+	skb = build_skb(token, cpsw_rxbuf_total_len(cpsw->rx_packet_max));
+	if (!skb) {
+		ndev->stats.rx_dropped++;
+		skb_free_frag(token);
+		goto requeue;
+	}
+
+	skb_reserve(skb, headroom);
+	skb_put(skb, len);
+	skb->dev = ndev;
+	if (status & CPDMA_RX_VLAN_ENCAP)
+		cpsw_rx_vlan_encap(skb);
+	if (priv->rx_ts_enabled)
+		cpts_rx_timestamp(cpsw->cpts, skb);
+	skb->protocol = eth_type_trans(skb, ndev);
+	netif_receive_skb(skb);
+	ndev->stats.rx_bytes += len;
+	ndev->stats.rx_packets++;
 
 requeue:
 	if (netif_dormant(ndev)) {
-		dev_kfree_skb_any(new_skb);
+		skb_free_frag(new_token);
 		return;
 	}
 
-	ch = cpsw->rxv[skb_get_queue_mapping(new_skb)].ch;
-	ret = cpdma_chan_submit(ch, new_skb, new_skb->data,
-				skb_tailroom(new_skb), 0);
+	ret = cpdma_chan_submit(cpsw->rxv[ch].ch, new_token,
+				new_token + CPSW_RXBUF_HEADROOM,
+				cpsw->rx_packet_max, 0);
 	if (WARN_ON(ret < 0))
-		dev_kfree_skb_any(new_skb);
+		skb_free_frag(new_token);
+	else
+		kmemleak_not_leak(new_token);
 }
 
 static void cpsw_split_res(struct net_device *ndev)
@@ -1166,6 +1315,11 @@ static int cpsw_rx_mq_poll(struct napi_struct *napi_rx, int budget)
 		writel(0xff, &cpsw->wr_regs->rx_en);
 	}
 
+	if (cpsw->xdp_flush) {
+		cpsw->xdp_flush = 0;
+		xdp_do_flush_map();
+	}
+
 	return num_rx;
 }
 
@@ -1182,6 +1336,11 @@ static int cpsw_rx_poll(struct napi_struct *napi_rx, int budget)
 			cpsw->rx_irq_disabled = false;
 			enable_irq(cpsw->irqs_table[0]);
 		}
+	}
+
+	if (cpsw->xdp_flush) {
+		cpsw->xdp_flush = 0;
+		xdp_do_flush_map();
 	}
 
 	return num_rx;
@@ -1507,14 +1666,25 @@ static void cpsw_get_ethtool_stats(struct net_device *ndev,
 	}
 }
 
-static inline int cpsw_tx_packet_submit(struct cpsw_priv *priv,
-					struct sk_buff *skb,
-					struct cpdma_chan *txch)
+static inline int cpsw_tx_submit_skb(struct cpsw_priv *priv,
+				     struct sk_buff *skb,
+				     struct cpdma_chan *txch)
 {
 	struct cpsw_common *cpsw = priv->cpsw;
 
 	skb_tx_timestamp(skb);
 	return cpdma_chan_submit(txch, skb, skb->data, skb->len,
+				 priv->emac_port + cpsw->data.dual_emac);
+}
+
+static inline int cpsw_tx_submit_xdpf(struct cpsw_priv *priv,
+				      struct xdp_frame *xdpf,
+				      struct cpdma_chan *txch)
+{
+	struct cpsw_common *cpsw = priv->cpsw;
+
+	return cpdma_chan_submit(txch, cpsw_xdpf_to_handle(xdpf), xdpf->data,
+				 xdpf->len,
 				 priv->emac_port + cpsw->data.dual_emac);
 }
 
@@ -1692,33 +1862,30 @@ static void cpsw_init_host_port(struct cpsw_priv *priv)
 static int cpsw_fill_rx_channels(struct cpsw_priv *priv)
 {
 	struct cpsw_common *cpsw = priv->cpsw;
-	struct sk_buff *skb;
 	int ch_buf_num;
 	int ch, i, ret;
+	u8 *token;
 
 	for (ch = 0; ch < cpsw->rx_ch_num; ch++) {
 		ch_buf_num = cpdma_chan_get_rx_buf_num(cpsw->rxv[ch].ch);
 		for (i = 0; i < ch_buf_num; i++) {
-			skb = __netdev_alloc_skb_ip_align(priv->ndev,
-							  cpsw->rx_packet_max,
-							  GFP_KERNEL);
-			if (!skb) {
-				cpsw_err(priv, ifup, "cannot allocate skb\n");
+			token = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
+			if (!token) {
+				cpsw_err(priv, ifup, "cannot allocate rx token\n");
 				return -ENOMEM;
 			}
 
-			skb_set_queue_mapping(skb, ch);
-			ret = cpdma_chan_submit(cpsw->rxv[ch].ch, skb,
-						skb->data, skb_tailroom(skb),
-						0);
+			ret = cpdma_chan_submit(cpsw->rxv[ch].ch, token,
+						token + CPSW_RXBUF_HEADROOM,
+						cpsw->rx_packet_max, 0);
 			if (ret < 0) {
 				cpsw_err(priv, ifup,
 					 "cannot submit skb to channel %d rx, error %d\n",
 					 ch, ret);
-				kfree_skb(skb);
+				skb_free_frag(token);
 				return ret;
 			}
-			kmemleak_not_leak(skb);
+			kmemleak_not_leak(token);
 		}
 
 		cpsw_info(priv, ifup, "ch %d rx, submitted %d descriptors\n",
@@ -2140,7 +2307,7 @@ static netdev_tx_t cpsw_ndo_start_xmit(struct sk_buff *skb,
 
 	txch = cpsw->txv[q_idx].ch;
 	txq = netdev_get_tx_queue(ndev, q_idx);
-	ret = cpsw_tx_packet_submit(priv, skb, txch);
+	ret = cpsw_tx_submit_skb(priv, skb, txch);
 	if (unlikely(ret != 0)) {
 		cpsw_err(priv, tx_err, "desc submit failed\n");
 		goto fail;
@@ -2670,6 +2837,97 @@ static int cpsw_ndo_setup_tc(struct net_device *ndev, enum tc_setup_type type,
 	}
 }
 
+static int cpsw_xdp_prog_setup(struct net_device *ndev, struct bpf_prog *prog)
+{
+	struct cpsw_priv *priv = netdev_priv(ndev);
+	struct bpf_prog *old_prog;
+
+	if (!priv->xdp_prog && !prog)
+		return 0;
+
+	old_prog = xchg(&priv->xdp_prog, prog);
+	if (old_prog)
+		bpf_prog_put(old_prog);
+
+	return 0;
+}
+
+static int cpsw_ndo_bpf(struct net_device *ndev, struct netdev_bpf *bpf)
+{
+	struct cpsw_priv *priv = netdev_priv(ndev);
+
+	switch (bpf->command) {
+	case XDP_SETUP_PROG:
+		return cpsw_xdp_prog_setup(ndev, bpf->prog);
+
+	case XDP_QUERY_PROG:
+		bpf->prog_id = priv->xdp_prog ? priv->xdp_prog->aux->id : 0;
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+static int cpsw_ndo_xdp_xmit(struct net_device *ndev, int n,
+			     struct xdp_frame **frames, u32 flags)
+{
+	unsigned int q_idx = smp_processor_id();
+	struct cpsw_priv *priv = netdev_priv(ndev);
+	struct cpsw_common *cpsw = priv->cpsw;
+	struct cpsw_meta_xdpf *frame_meta;
+	struct cpdma_chan *txch;
+	int drops = 0;
+	int i;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	if (q_idx >= cpsw->tx_ch_num)
+		q_idx = q_idx % cpsw->tx_ch_num;
+
+	txch = cpsw->txv[q_idx].ch;
+
+	for (i = 0; i < n; i++) {
+		struct xdp_frame *xdpf = frames[i];
+		int ret;
+
+		if (xdpf->len < CPSW_MIN_PACKET_SIZE) {
+			xdp_return_frame_rx_napi(xdpf);
+			drops++;
+			continue;
+		}
+
+		xdpf->metasize = sizeof(struct cpsw_meta_xdpf);
+		frame_meta = xdpf->data - xdpf->metasize;
+		frame_meta->ndev = ndev;
+		frame_meta->ch = q_idx;
+
+		ret = cpsw_tx_submit_xdpf(priv, xdpf, txch);
+		if (ret) {
+			xdp_return_frame_rx_napi(xdpf);
+			drops++;
+		}
+	}
+
+	/* If there is no more tx desc left free then we need to
+	 * tell the kernel to stop sending us tx frames.
+	 */
+	if (unlikely(!cpdma_check_free_tx_desc(txch))) {
+		struct netdev_queue *txq = netdev_get_tx_queue(ndev, q_idx);
+
+		netif_tx_stop_queue(txq);
+
+		/* Barrier, so that stop_queue visible to other cpus */
+		smp_mb__after_atomic();
+
+		if (cpdma_check_free_tx_desc(txch))
+			netif_tx_wake_queue(txq);
+	}
+
+	return n - drops;
+}
+
 static const struct net_device_ops cpsw_netdev_ops = {
 	.ndo_open		= cpsw_ndo_open,
 	.ndo_stop		= cpsw_ndo_stop,
@@ -2686,6 +2944,8 @@ static const struct net_device_ops cpsw_netdev_ops = {
 	.ndo_vlan_rx_add_vid	= cpsw_ndo_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= cpsw_ndo_vlan_rx_kill_vid,
 	.ndo_setup_tc           = cpsw_ndo_setup_tc,
+	.ndo_bpf                = cpsw_ndo_bpf,
+	.ndo_xdp_xmit           = cpsw_ndo_xdp_xmit,
 };
 
 static int cpsw_get_regs_len(struct net_device *ndev)
@@ -2906,10 +3166,60 @@ static int cpsw_check_ch_settings(struct cpsw_common *cpsw,
 	return 0;
 }
 
+static void cpsw_xdp_rxq_unreq(struct cpsw_common *cpsw, int ch)
+{
+	struct cpsw_slave *slave;
+	struct cpsw_priv *priv;
+	int i;
+
+	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++) {
+		if (!slave->ndev)
+			continue;
+
+		priv = netdev_priv(slave->ndev);
+		xdp_rxq_info_unreg(&priv->xdp_rxq[ch]);
+	}
+}
+
+static int cpsw_xdp_rxq_req(struct cpsw_common *cpsw, int ch)
+{
+	struct cpsw_slave *slave;
+	struct cpsw_priv *priv;
+	int i, ret;
+
+	/* As channels are common for both ports sharing same queues, xdp_rxq
+	 * information also becomes shared and used by every packet on this
+	 * channel. But exch xdp_rxq holds link on netdev, which by the theory
+	 * can have different memory model an so, network device must hold it's
+	 * own set of rxq and thus both netdevs should be prepared
+	 */
+	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++) {
+		if (!slave->ndev)
+			continue;
+
+		priv = netdev_priv(slave->ndev);
+
+		ret = xdp_rxq_info_reg(&priv->xdp_rxq[ch], priv->ndev, ch);
+		if (ret)
+			goto err;
+
+		ret = xdp_rxq_info_reg_mem_model(&priv->xdp_rxq[ch],
+						 MEM_TYPE_PAGE_ORDER0, NULL);
+		if (ret)
+			goto err;
+	}
+
+	return ret;
+
+err:
+	cpsw_xdp_rxq_unreq(cpsw, ch);
+	return ret;
+}
+
 static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 {
 	struct cpsw_common *cpsw = priv->cpsw;
-	void (*handler)(void *, int, int);
+	cpdma_handler_fn handler;
 	struct netdev_queue *queue;
 	struct cpsw_vector *vec;
 	int ret, *ch, vch;
@@ -2926,7 +3236,9 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 
 	while (*ch < ch_num) {
 		vch = rx ? *ch : 7 - *ch;
-		vec[*ch].ch = cpdma_chan_create(cpsw->dma, vch, handler, rx);
+		vec[*ch].ch =
+		    cpdma_chan_create(cpsw->dma, vch, handler, &vec[*ch], rx);
+
 		queue = netdev_get_tx_queue(priv->ndev, *ch);
 		queue->tx_maxrate = 0;
 
@@ -2936,6 +3248,11 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 		if (!vec[*ch].ch)
 			return -EINVAL;
 
+		if (rx && cpsw_xdp_rxq_req(cpsw, *ch)) {
+			cpdma_chan_destroy(vec[*ch].ch);
+			return -EINVAL;
+		}
+
 		cpsw_info(priv, ifup, "created new %d %s channel\n", *ch,
 			  (rx ? "rx" : "tx"));
 		(*ch)++;
@@ -2943,6 +3260,9 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 
 	while (*ch > ch_num) {
 		(*ch)--;
+
+		if (rx)
+			cpsw_xdp_rxq_unreq(cpsw, *ch);
 
 		ret = cpdma_chan_destroy(vec[*ch].ch);
 		if (ret)
@@ -3639,17 +3959,35 @@ static int cpsw_probe(struct platform_device *pdev)
 		cpsw->quirk_irq = 1;
 
 	ch = cpsw->quirk_irq ? 0 : 7;
-	cpsw->txv[0].ch = cpdma_chan_create(cpsw->dma, ch, cpsw_tx_handler, 0);
+	cpsw->txv[0].ch =
+	    cpdma_chan_create(cpsw->dma, ch, cpsw_tx_handler, &cpsw->txv[0], 0);
 	if (IS_ERR(cpsw->txv[0].ch)) {
 		dev_err(priv->dev, "error initializing tx dma channel\n");
 		ret = PTR_ERR(cpsw->txv[0].ch);
 		goto clean_dma_ret;
 	}
+	cpsw->txv[0].ndev = ndev;
 
-	cpsw->rxv[0].ch = cpdma_chan_create(cpsw->dma, 0, cpsw_rx_handler, 1);
+	cpsw->rxv[0].ch =
+	    cpdma_chan_create(cpsw->dma, 0, cpsw_rx_handler, &cpsw->rxv[0], 1);
 	if (IS_ERR(cpsw->rxv[0].ch)) {
 		dev_err(priv->dev, "error initializing rx dma channel\n");
 		ret = PTR_ERR(cpsw->rxv[0].ch);
+		goto clean_dma_ret;
+	}
+	cpsw->rxv[0].ndev = ndev;
+
+	if (xdp_rxq_info_reg(&priv->xdp_rxq[0], ndev, 0)) {
+		cpdma_chan_destroy(cpsw->rxv[0].ch);
+		ret = -EINVAL;
+		goto clean_dma_ret;
+	}
+
+	if (xdp_rxq_info_reg_mem_model
+	    (&priv->xdp_rxq[0], MEM_TYPE_PAGE_ORDER0, NULL)) {
+		xdp_rxq_info_unreg(&priv->xdp_rxq[0]);
+		cpdma_chan_destroy(cpsw->rxv[0].ch);
+		ret = -EINVAL;
 		goto clean_dma_ret;
 	}
 

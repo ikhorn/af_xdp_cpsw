@@ -123,6 +123,7 @@ struct cpdma_chan {
 	u32				desc_num;
 	u32				mask;
 	cpdma_handler_fn		handler;
+	void				*ctx;
 	enum dma_data_direction		dir;
 	struct cpdma_chan_stats		stats;
 	/* offsets into dmaregs */
@@ -883,7 +884,8 @@ u32 cpdma_chan_get_rate(struct cpdma_chan *ch)
 EXPORT_SYMBOL_GPL(cpdma_chan_get_rate);
 
 struct cpdma_chan *cpdma_chan_create(struct cpdma_ctlr *ctlr, int chan_num,
-				     cpdma_handler_fn handler, int rx_type)
+				     cpdma_handler_fn handler, void *ctx,
+				     int rx_type)
 {
 	int offset = chan_num * 4;
 	struct cpdma_chan *chan;
@@ -909,6 +911,7 @@ struct cpdma_chan *cpdma_chan_create(struct cpdma_ctlr *ctlr, int chan_num,
 	chan->state	= CPDMA_STATE_IDLE;
 	chan->chan_num	= chan_num;
 	chan->handler	= handler;
+	chan->ctx	= ctx;
 	chan->rate	= 0;
 	chan->weight	= 0;
 
@@ -1128,7 +1131,7 @@ static void __cpdma_chan_free(struct cpdma_chan *chan,
 
 	dma_unmap_single(ctlr->dev, buff_dma, origlen, chan->dir);
 	cpdma_desc_free(pool, desc, 1);
-	(*chan->handler)((void *)token, outlen, status);
+	(*chan->handler)(chan->ctx, (void *)token, outlen, status);
 }
 
 static int __cpdma_chan_process(struct cpdma_chan *chan)
