@@ -429,8 +429,6 @@ static inline void slave_write(struct cpsw_slave *slave, u32 val, u32 offset)
 
 struct cpsw_vector {
 	struct cpdma_chan *ch;
-	/* TODO: We could use container_of + vector num probably. */
-	struct net_device *ndev;
 	int budget;
 };
 
@@ -488,9 +486,8 @@ struct cpsw_stats {
 	int stat_offset;
 };
 
-/* The rxbuf shall include headroom compatible with both skb and xdpf */
-#define CPSW_RXBUF_HEADROOM (max(XDP_PACKET_HEADROOM, NET_SKB_PAD) + \
-			     NET_IP_ALIGN)
+/* The buf shall include headroom compatible with both skb and xdpf */
+#define CPSW_HEADROOM (max(XDP_PACKET_HEADROOM, NET_SKB_PAD) + NET_IP_ALIGN)
 
 enum {
 	CPSW_STATS,
@@ -849,11 +846,6 @@ static void cpsw_intr_disable(struct cpsw_common *cpsw)
 	return;
 }
 
-/* Both skb and xdp frames go down the same route.
- * In tx_handler callback we need to somehow distinguish whether we got skb or
- * xdpf. Both pointers are guaranteed to have LSB == 0, so we can use it as
- * a temporary marker.
- */
 static int cpsw_is_xdpf_handle(void *handle)
 {
 	return (unsigned long)handle & BIT(0);
@@ -869,26 +861,25 @@ static struct xdp_frame *cpsw_handle_to_xdpf(void *handle)
 	return (struct xdp_frame *)((unsigned long)handle & ~BIT(0));
 }
 
-struct cpsw_meta_xdpf {
+struct cpsw_meta_xdp {
 	struct net_device *ndev;
 	int ch;
 };
 
-static void cpsw_tx_handler(void *ctx, void *token, int len, int status)
+static void cpsw_tx_handler(void *token, int len, int status)
 {
-	struct cpsw_meta_xdpf *frame_meta;
+	struct cpsw_meta_xdp	*xmeta;
+	struct xdp_frame	*xdpf;
+	struct net_device	*ndev;
 	struct netdev_queue	*txq;
 	struct sk_buff		*skb;
-	struct xdp_frame	*xdpf;
-	struct cpsw_vector	*txv = ctx;
-	struct net_device	*ndev;
 	int			ch;
 
 	if (cpsw_is_xdpf_handle(token)) {
 		xdpf = cpsw_handle_to_xdpf(token);
-		frame_meta = xdpf->data - xdpf->metasize;
-		ndev = frame_meta->ndev;
-		ch = frame_meta->ch;
+		xmeta = xdpf->data - xdpf->metasize;
+		ndev = xmeta->ndev;
+		ch = xmeta->ch;
 		xdp_return_frame_rx_napi(xdpf);
 	} else {
 		skb = token;
@@ -954,7 +945,7 @@ static void cpsw_rx_vlan_encap(struct sk_buff *skb)
 
 static unsigned int cpsw_rxbuf_total_len(unsigned int len)
 {
-	len += CPSW_RXBUF_HEADROOM;
+	len += CPSW_HEADROOM;
 	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
 	return SKB_DATA_ALIGN(len);
 }
@@ -1018,17 +1009,15 @@ out:
 	return ret;
 }
 
-static void cpsw_rx_handler(void *ctx, void *token, int len, int status)
+static void cpsw_rx_handler(void *token, int len, int status)
 {
-	struct sk_buff		*skb;
-	struct cpsw_vector	*rxv = ctx;
-	struct net_device	*ndev = rxv->ndev;
+	struct cpsw_meta_xdp	*xmeta = token;
+	struct cpsw_common	*cpsw = ndev_to_cpsw(xmeta->ndev);
+	int			ret = 0, port, ch = xmeta->ch;
+	int			headroom = CPSW_HEADROOM;
+	struct net_device	*ndev = xmeta->ndev;
 	struct cpsw_priv	*priv;
-	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
-	int			ch = rxv - cpsw->rxv;
-	int			ret = 0, port;
-	int			headroom = CPSW_RXBUF_HEADROOM;
-	u8			*new_token;
+	struct sk_buff		*skb;
 	struct xdp_buff		xdp;
 
 	if (cpsw->data.dual_emac) {
@@ -1047,7 +1036,6 @@ static void cpsw_rx_handler(void *ctx, void *token, int len, int status)
 			 * in reducing of the number of rx descriptor in
 			 * DMA engine, requeue skb back to cpdma.
 			 */
-			new_token = token;
 			goto requeue;
 		}
 
@@ -1056,17 +1044,17 @@ static void cpsw_rx_handler(void *ctx, void *token, int len, int status)
 		return;
 	}
 
-	new_token = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
-	if (!new_token) {
+	xmeta = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
+	if (!xmeta) {
 		ndev->stats.rx_dropped++;
-		new_token = token;
+		xmeta = token;
 		goto requeue;
 	}
 
 	priv = netdev_priv(ndev);
 	if (priv->xdp_prog) {
 		xdp_set_data_meta_invalid(&xdp);
-		xdp.data = (u8 *)token + CPSW_RXBUF_HEADROOM;
+		xdp.data = (u8 *)token + CPSW_HEADROOM;
 		xdp.data_end = xdp.data + len;
 		xdp.data_hard_start = token;
 		xdp.rxq = &priv->xdp_rxq[ch];
@@ -1104,17 +1092,19 @@ static void cpsw_rx_handler(void *ctx, void *token, int len, int status)
 
 requeue:
 	if (netif_dormant(ndev)) {
-		skb_free_frag(new_token);
+		skb_free_frag(xmeta);
 		return;
 	}
 
-	ret = cpdma_chan_submit(cpsw->rxv[ch].ch, new_token,
-				new_token + CPSW_RXBUF_HEADROOM,
+	xmeta->ndev = ndev;
+	xmeta->ch = ch;
+	ret = cpdma_chan_submit(cpsw->rxv[ch].ch, xmeta,
+				(u8 *)xmeta + CPSW_HEADROOM,
 				cpsw->rx_packet_max, 0);
 	if (WARN_ON(ret < 0))
-		skb_free_frag(new_token);
+		skb_free_frag(xmeta);
 	else
-		kmemleak_not_leak(new_token);
+		kmemleak_not_leak(xmeta);
 }
 
 static void cpsw_split_res(struct net_device *ndev)
@@ -1862,30 +1852,32 @@ static void cpsw_init_host_port(struct cpsw_priv *priv)
 static int cpsw_fill_rx_channels(struct cpsw_priv *priv)
 {
 	struct cpsw_common *cpsw = priv->cpsw;
+	struct cpsw_meta_xdp *xmeta;
 	int ch_buf_num;
 	int ch, i, ret;
-	u8 *token;
 
 	for (ch = 0; ch < cpsw->rx_ch_num; ch++) {
 		ch_buf_num = cpdma_chan_get_rx_buf_num(cpsw->rxv[ch].ch);
 		for (i = 0; i < ch_buf_num; i++) {
-			token = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
-			if (!token) {
+			xmeta = cpsw_rxbuf_alloc(cpsw->rx_packet_max);
+			if (!xmeta) {
 				cpsw_err(priv, ifup, "cannot allocate rx token\n");
 				return -ENOMEM;
 			}
 
-			ret = cpdma_chan_submit(cpsw->rxv[ch].ch, token,
-						token + CPSW_RXBUF_HEADROOM,
+			xmeta->ndev = priv->ndev;
+			xmeta->ch = ch;
+			ret = cpdma_chan_submit(cpsw->rxv[ch].ch, xmeta,
+						(u8 *)xmeta + CPSW_HEADROOM,
 						cpsw->rx_packet_max, 0);
 			if (ret < 0) {
 				cpsw_err(priv, ifup,
 					 "cannot submit skb to channel %d rx, error %d\n",
 					 ch, ret);
-				skb_free_frag(token);
+				skb_free_frag(xmeta);
 				return ret;
 			}
-			kmemleak_not_leak(token);
+			kmemleak_not_leak(xmeta);
 		}
 
 		cpsw_info(priv, ifup, "ch %d rx, submitted %d descriptors\n",
@@ -2872,13 +2864,13 @@ static int cpsw_ndo_bpf(struct net_device *ndev, struct netdev_bpf *bpf)
 static int cpsw_ndo_xdp_xmit(struct net_device *ndev, int n,
 			     struct xdp_frame **frames, u32 flags)
 {
-	unsigned int q_idx = smp_processor_id();
 	struct cpsw_priv *priv = netdev_priv(ndev);
+	unsigned int q_idx = smp_processor_id();
 	struct cpsw_common *cpsw = priv->cpsw;
-	struct cpsw_meta_xdpf *frame_meta;
+	struct cpsw_meta_xdp *xmeta;
 	struct cpdma_chan *txch;
-	int drops = 0;
-	int i;
+	struct xdp_frame *xdpf;
+	int i, ret, drops = 0;
 
 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
 		return -EINVAL;
@@ -2887,21 +2879,18 @@ static int cpsw_ndo_xdp_xmit(struct net_device *ndev, int n,
 		q_idx = q_idx % cpsw->tx_ch_num;
 
 	txch = cpsw->txv[q_idx].ch;
-
 	for (i = 0; i < n; i++) {
-		struct xdp_frame *xdpf = frames[i];
-		int ret;
-
+		xdpf = frames[i];
 		if (xdpf->len < CPSW_MIN_PACKET_SIZE) {
 			xdp_return_frame_rx_napi(xdpf);
 			drops++;
 			continue;
 		}
 
-		xdpf->metasize = sizeof(struct cpsw_meta_xdpf);
-		frame_meta = xdpf->data - xdpf->metasize;
-		frame_meta->ndev = ndev;
-		frame_meta->ch = q_idx;
+		xdpf->metasize = sizeof(struct cpsw_meta_xdp);
+		xmeta = xdpf->data - xdpf->metasize;
+		xmeta->ndev = ndev;
+		xmeta->ch = q_idx;
 
 		ret = cpsw_tx_submit_xdpf(priv, xdpf, txch);
 		if (ret) {
@@ -3166,7 +3155,7 @@ static int cpsw_check_ch_settings(struct cpsw_common *cpsw,
 	return 0;
 }
 
-static void cpsw_xdp_rxq_unreq(struct cpsw_common *cpsw, int ch)
+static void cpsw_xdp_rxq_unreg(struct cpsw_common *cpsw, int ch)
 {
 	struct cpsw_slave *slave;
 	struct cpsw_priv *priv;
@@ -3181,7 +3170,7 @@ static void cpsw_xdp_rxq_unreq(struct cpsw_common *cpsw, int ch)
 	}
 }
 
-static int cpsw_xdp_rxq_req(struct cpsw_common *cpsw, int ch)
+static int cpsw_xdp_rxq_reg(struct cpsw_common *cpsw, int ch)
 {
 	struct cpsw_slave *slave;
 	struct cpsw_priv *priv;
@@ -3212,15 +3201,15 @@ static int cpsw_xdp_rxq_req(struct cpsw_common *cpsw, int ch)
 	return ret;
 
 err:
-	cpsw_xdp_rxq_unreq(cpsw, ch);
+	cpsw_xdp_rxq_unreg(cpsw, ch);
 	return ret;
 }
 
 static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 {
 	struct cpsw_common *cpsw = priv->cpsw;
-	cpdma_handler_fn handler;
 	struct netdev_queue *queue;
+	cpdma_handler_fn handler;
 	struct cpsw_vector *vec;
 	int ret, *ch, vch;
 
@@ -3236,8 +3225,7 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 
 	while (*ch < ch_num) {
 		vch = rx ? *ch : 7 - *ch;
-		vec[*ch].ch =
-		    cpdma_chan_create(cpsw->dma, vch, handler, &vec[*ch], rx);
+		vec[*ch].ch = cpdma_chan_create(cpsw->dma, vch, handler, rx);
 
 		queue = netdev_get_tx_queue(priv->ndev, *ch);
 		queue->tx_maxrate = 0;
@@ -3248,7 +3236,7 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 		if (!vec[*ch].ch)
 			return -EINVAL;
 
-		if (rx && cpsw_xdp_rxq_req(cpsw, *ch)) {
+		if (rx && cpsw_xdp_rxq_reg(cpsw, *ch)) {
 			cpdma_chan_destroy(vec[*ch].ch);
 			return -EINVAL;
 		}
@@ -3262,7 +3250,7 @@ static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
 		(*ch)--;
 
 		if (rx)
-			cpsw_xdp_rxq_unreq(cpsw, *ch);
+			cpsw_xdp_rxq_unreg(cpsw, *ch);
 
 		ret = cpdma_chan_destroy(vec[*ch].ch);
 		if (ret)
@@ -3960,36 +3948,29 @@ static int cpsw_probe(struct platform_device *pdev)
 
 	ch = cpsw->quirk_irq ? 0 : 7;
 	cpsw->txv[0].ch =
-	    cpdma_chan_create(cpsw->dma, ch, cpsw_tx_handler, &cpsw->txv[0], 0);
+	    cpdma_chan_create(cpsw->dma, ch, cpsw_tx_handler, 0);
 	if (IS_ERR(cpsw->txv[0].ch)) {
 		dev_err(priv->dev, "error initializing tx dma channel\n");
 		ret = PTR_ERR(cpsw->txv[0].ch);
 		goto clean_dma_ret;
 	}
-	cpsw->txv[0].ndev = ndev;
 
 	cpsw->rxv[0].ch =
-	    cpdma_chan_create(cpsw->dma, 0, cpsw_rx_handler, &cpsw->rxv[0], 1);
+	    cpdma_chan_create(cpsw->dma, 0, cpsw_rx_handler, 1);
 	if (IS_ERR(cpsw->rxv[0].ch)) {
 		dev_err(priv->dev, "error initializing rx dma channel\n");
 		ret = PTR_ERR(cpsw->rxv[0].ch);
 		goto clean_dma_ret;
 	}
-	cpsw->rxv[0].ndev = ndev;
 
-	if (xdp_rxq_info_reg(&priv->xdp_rxq[0], ndev, 0)) {
-		cpdma_chan_destroy(cpsw->rxv[0].ch);
-		ret = -EINVAL;
+	ret = xdp_rxq_info_reg(&priv->xdp_rxq[0], ndev, 0);
+	if (ret)
 		goto clean_dma_ret;
-	}
 
-	if (xdp_rxq_info_reg_mem_model
-	    (&priv->xdp_rxq[0], MEM_TYPE_PAGE_ORDER0, NULL)) {
-		xdp_rxq_info_unreg(&priv->xdp_rxq[0]);
-		cpdma_chan_destroy(cpsw->rxv[0].ch);
-		ret = -EINVAL;
+	ret = xdp_rxq_info_reg_mem_model(&priv->xdp_rxq[0],
+					 MEM_TYPE_PAGE_ORDER0, NULL);
+	if (ret)
 		goto clean_dma_ret;
-	}
 
 	ale_params.dev			= &pdev->dev;
 	ale_params.ale_ageout		= ale_ageout;
