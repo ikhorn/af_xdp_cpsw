@@ -3,6 +3,7 @@
 #include <linux/kbuild.h>
 
 #define SYSNR(_NR) DEFINE(SYS ## _NR, _NR)
+#define __NR_mmap (__NR_SYSCALL_BASE + 90)
 
 void syscall_defines(void)
 {
