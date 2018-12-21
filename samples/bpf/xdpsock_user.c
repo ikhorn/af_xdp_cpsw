@@ -409,7 +409,7 @@ static struct xdp_umem *xdp_umem_configure(int sfd)
 	struct xdp_umem_reg mr;
 	struct xdp_umem *umem;
 	socklen_t optlen;
-	void *bufs;
+	u64 *bufs;
 
 	umem = calloc(1, sizeof(*umem));
 	lassert(umem);
@@ -417,6 +417,7 @@ static struct xdp_umem *xdp_umem_configure(int sfd)
 	lassert(posix_memalign(&bufs, getpagesize(), /* PAGE_SIZE aligned */
 			       NUM_FRAMES * FRAME_SIZE) == 0);
 
+	printf("---memory request bufs = %lu, &bufs = %lu", bufs, &bufs);
 	mr.addr = (unsigned long)bufs;
 	mr.len = NUM_FRAMES * FRAME_SIZE;
 	mr.chunk_size = FRAME_SIZE;
@@ -432,6 +433,7 @@ static struct xdp_umem *xdp_umem_configure(int sfd)
 	lassert(getsockopt(sfd, SOL_XDP, XDP_MMAP_OFFSETS, &off,
 			   &optlen) == 0);
 
+	printf("---fillring off.fr.desc = %lld, size = %lld, sizeofft = %u", off.fr.desc, off.fr.desc + FQ_NUM_DESCS * sizeof(u64), sizeof(off_t));
 	umem->fq.map = mmap(0, off.fr.desc +
 			    FQ_NUM_DESCS * sizeof(u64),
 			    PROT_READ | PROT_WRITE,
@@ -446,6 +448,7 @@ static struct xdp_umem *xdp_umem_configure(int sfd)
 	umem->fq.ring = umem->fq.map + off.fr.desc;
 	umem->fq.cached_cons = FQ_NUM_DESCS;
 
+        printf("---complring off.cr.desc = %lld, size = %lld", off.cr.desc, off.cr.desc + CQ_NUM_DESCS * sizeof(u64));
 	umem->cq.map = mmap(0, off.cr.desc +
 			     CQ_NUM_DESCS * sizeof(u64),
 			     PROT_READ | PROT_WRITE,
@@ -507,6 +510,7 @@ static struct xdpsock *xsk_configure(struct xdp_umem *umem)
 			   &optlen) == 0);
 
 	/* Rx */
+	printf("---rxring off.rx.desc = %lld, size = %lld", off.rx.desc, off.rx.desc + NUM_DESCS * sizeof(struct xdp_desc));
 	xsk->rx.map = mmap(NULL,
 			   off.rx.desc +
 			   NUM_DESCS * sizeof(struct xdp_desc),
@@ -522,6 +526,7 @@ static struct xdpsock *xsk_configure(struct xdp_umem *umem)
 	}
 
 	/* Tx */
+	printf("---txring off.tx.desc = %lld, size = %lld", off.tx.desc, off.tx.desc + NUM_DESCS * sizeof(struct xdp_desc));
 	xsk->tx.map = mmap(NULL,
 			   off.tx.desc +
 			   NUM_DESCS * sizeof(struct xdp_desc),

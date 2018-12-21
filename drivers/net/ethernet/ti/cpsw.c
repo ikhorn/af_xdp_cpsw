@@ -999,8 +999,11 @@ static int cpsw_run_xdp(struct cpsw_priv *priv, struct xdp_buff *xdp)
 		/* fall through */
 	case XDP_ABORTED:
 		trace_xdp_exception(ndev, prog, act);
+			dev_err(&ndev->dev, "aborting packet");
 		/* fall through -- handle aborts by dropping packet */
 	case XDP_DROP:
+		if (act == XDP_DROP)
+			dev_err(&ndev->dev, "dropping packet");
 		xdp_return_buff(xdp);
 		break;
 	}
@@ -2288,6 +2291,7 @@ static netdev_tx_t cpsw_ndo_start_xmit(struct sk_buff *skb,
 		ndev->stats.tx_dropped++;
 		return NET_XMIT_DROP;
 	}
+	printk(KERN_ERR "--> regular skb xmit\n");
 
 	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP &&
 	    priv->tx_ts_enabled && cpts_can_timestamp(cpts, skb))
@@ -2834,6 +2838,8 @@ static int cpsw_xdp_prog_setup(struct net_device *ndev, struct bpf_prog *prog)
 	struct cpsw_priv *priv = netdev_priv(ndev);
 	struct bpf_prog *old_prog;
 
+dev_err(&ndev->dev, "----> ssssss loading the program");
+
 	if (!priv->xdp_prog && !prog)
 		return 0;
 
@@ -2872,6 +2878,7 @@ static int cpsw_ndo_xdp_xmit(struct net_device *ndev, int n,
 	struct xdp_frame *xdpf;
 	int i, ret, drops = 0;
 
+	printk(KERN_ERR "--> xdp xmit\n");
 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
 		return -EINVAL;
 

@@ -261,6 +261,7 @@ static int xdp_umem_pin_pages(struct xdp_umem *umem)
 	down_write(&current->mm->mmap_sem);
 	npgs = get_user_pages(umem->address, umem->npgs,
 			      gup_flags, &umem->pgs[0], NULL);
+	printk(KERN_ERR "--> pages regn = %d, pinned pages=%ld\n", umem->npgs, npgs);
 	up_write(&current->mm->mmap_sem);
 
 	if (npgs != umem->npgs) {
@@ -351,10 +352,12 @@ static int xdp_umem_reg(struct xdp_umem *umem, struct xdp_umem_reg *mr)
 
 	umem->pid = get_task_pid(current, PIDTYPE_PID);
 	umem->address = (unsigned long)addr;
+	printk(KERN_ERR "--> UMEM address = %lx\n", umem->address);
 	umem->chunk_mask = ~((u64)chunk_size - 1);
 	umem->size = size;
 	umem->headroom = headroom;
 	umem->chunk_size_nohr = chunk_size - headroom;
+	printk(KERN_ERR "--> UMEM size %llu, page size = %lu\n", size, PAGE_SIZE);
 	umem->npgs = size / PAGE_SIZE;
 	umem->pgs = NULL;
 	umem->user = NULL;
@@ -377,8 +380,13 @@ static int xdp_umem_reg(struct xdp_umem *umem, struct xdp_umem_reg *mr)
 		goto out_account;
 	}
 
-	for (i = 0; i < umem->npgs; i++)
+	printk(KERN_ERR "--> some addresses from ks %p, %p, %p\n", &err, umem, umem->pages);
+	for (i = 0; i < umem->npgs; i++) {
 		umem->pages[i].addr = kmap(umem->pgs[i]);
+		if (i < 9000)
+			printk(KERN_ERR "--> page %d, vaddr = %p, paddr = %p\n", i,
+			       umem->pages[i].addr, umem->pgs[i]);
+	}
 
 	return 0;
 

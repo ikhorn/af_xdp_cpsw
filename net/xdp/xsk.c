@@ -77,6 +77,12 @@ static int __xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
 	}
 
 	to_buf = xdp_umem_get_data(xs->umem, addr);
+
+	printk(KERN_ERR "--> xsk_rcv to_buf=%p\n", to_buf);
+	printk(KERN_ERR "--> xsk_rcv from_buf=%p\n", from_buf);
+	printk(KERN_ERR "--> xsk_rcv addr=%llu\n", addr);
+	printk(KERN_ERR "--> xsk_rcv umem_headroom=%u\n", xs->umem->headroom);
+	printk(KERN_ERR "--> xsk_rcv len=%u\n", len);
 	memcpy(to_buf, from_buf, len + metalen);
 	addr += metalen;
 	err = xskq_produce_batch_desc(xs->rx, addr, len);
@@ -229,6 +235,8 @@ static int xsk_generic_xmit(struct sock *sk, struct msghdr *m,
 	int err = 0;
 
 	mutex_lock(&xs->mutex);
+
+	printk(KERN_ERR "--> generic xdp call xmit\n");
 
 	while (xskq_peek_desc(xs->tx, &desc)) {
 		char *buffer;
@@ -516,6 +524,8 @@ static int xsk_setsockopt(struct socket *sock, int level, int optname,
 		if (copy_from_user(&entries, optval, sizeof(entries)))
 			return -EFAULT;
 
+		printk(KERN_ERR "--rx/tx ring entries num = %u\n", entries);
+
 		mutex_lock(&xs->mutex);
 		q = (optname == XDP_TX_RING) ? &xs->tx : &xs->rx;
 		err = xsk_init_queue(entries, q, false);
@@ -529,6 +539,12 @@ static int xsk_setsockopt(struct socket *sock, int level, int optname,
 
 		if (copy_from_user(&mr, optval, sizeof(mr)))
 			return -EFAULT;
+
+	printk(KERN_ERR "--> req umme -> addr =%llu\n", mr.addr);
+	printk(KERN_ERR "--> req umme -> len =%llu\n", mr.len);
+	printk(KERN_ERR "--> req umme -> chunk_size =%u\n", mr.chunk_size);
+	printk(KERN_ERR "--> req umme -> headroom =%u\n", mr.headroom);
+
 
 		mutex_lock(&xs->mutex);
 		if (xs->umem) {
@@ -556,6 +572,8 @@ static int xsk_setsockopt(struct socket *sock, int level, int optname,
 
 		if (copy_from_user(&entries, optval, sizeof(entries)))
 			return -EFAULT;
+
+		printk(KERN_ERR "--fill/compl ring entries num = %u\n", entries);
 
 		mutex_lock(&xs->mutex);
 		if (!xs->umem) {
@@ -659,6 +677,7 @@ static int xsk_mmap(struct file *file, struct socket *sock,
 	unsigned long pfn;
 	struct page *qpg;
 
+	printk(KERN_ERR "--offset typesize = %u, offset = %llu\n", sizeof(loff_t), offset);
 	if (offset == XDP_PGOFF_RX_RING) {
 		q = READ_ONCE(xs->rx);
 	} else if (offset == XDP_PGOFF_TX_RING) {
