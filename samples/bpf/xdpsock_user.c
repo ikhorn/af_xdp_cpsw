@@ -44,7 +44,7 @@
 #define PF_XDP AF_XDP
 #endif
 
-#define NUM_FRAMES 131072
+#define NUM_FRAMES 256
 #define FRAME_HEADROOM 0
 #define FRAME_SHIFT 11
 #define FRAME_SIZE 2048
